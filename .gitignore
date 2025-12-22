@@ -1,0 +1,11 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+data/**
+!data/.gitkeep
+firecrawl_hits_*.csv
+leads_only.csv
+all_results.csv
+*.ipynb
+*.csv

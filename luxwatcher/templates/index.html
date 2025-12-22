@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Luxury Lead Watcher</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <div>
+          <h1>Luxury Lead Watcher</h1>
+          <p class="sub">Scrapes Reddit every 24 hours (last 24h) and shows actionable leads.</p>
+        </div>
+        <div class="actions">
+          <select id="runSelect" class="input select" title="Select a previous run"></select>
+          <button id="runNow" class="btn btn-primary">Run now</button>
+          <button id="refresh" class="btn">Refresh</button>
+        </div>
+      </header>
+
+      <section class="status">
+        <div class="pill" id="runningPill">Idle</div>
+        <div class="kv"><span>Last started</span><code id="lastStarted">—</code></div>
+        <div class="kv"><span>Last finished</span><code id="lastFinished">—</code></div>
+        <div class="kv grow"><span>Last error</span><code id="lastError">—</code></div>
+      </section>
+
+      <section class="stage">
+        <div class="kv"><span>Stage</span><code id="stage">—</code></div>
+        <div class="kv grow"><span>Detail</span><code id="stageDetail">—</code></div>
+      </section>
+
+      <section class="toolbar">
+        <input id="filter" class="input" placeholder="Filter leads (market, vertical, title, reason…)" />
+        <div class="hint">Tip: set <code>PERPLEXITY_API_KEY</code> in <code>.env</code> for better classification.</div>
+      </section>
+
+      <section class="tableWrap">
+        <table class="table" id="leadsTable">
+          <thead>
+            <tr>
+              <th>Run</th>
+              <th>Market</th>
+              <th>Category</th>
+              <th>Intent</th>
+              <th>Confidence</th>
+              <th>Query</th>
+              <th>Title</th>
+              <th>URL</th>
+              <th>Reason</th>
+              <th>Evidence</th>
+              <th>TS (UTC)</th>
+            </tr>
+          </thead>
+          <tbody id="leadsBody"></tbody>
+        </table>
+      </section>
+
+      <footer class="footer">
+        <span class="small">Run: <code id="shownRun">—</code> • Data source: <code id="leadsPath">—</code></span>
+      </footer>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

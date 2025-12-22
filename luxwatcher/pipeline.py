@@ -1,0 +1,907 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+import requests
+
+from luxwatcher.queries import get_queries
+from luxwatcher.storage import append_rows, ensure_csv_has_header, ensure_dir
+
+
+FIRECRAWL_URL = "https://api.firecrawl.dev/v2/search"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class Config:
+    data_dir: Path = REPO_ROOT / "data"
+    tbs: str = "qdr:d"  # last 24 hours
+    limit: int = 10
+    firecrawl_api_key: str | None = None
+    apify_token: str | None = None
+    apify_actor_id: str = "oAuCIx3ItNrs2okjQ"
+    apify_max_urls: int = 60
+    max_urls: int = 300
+    use_hits_cache: bool = False
+    hits_max_age_hours: float = 24.0
+    perplexity_api_key: str | None = None
+    perplexity_model: str = "sonar"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_organization: str | None = None
+    openai_project: str | None = None
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
+    batch_size: int = 20
+    max_comments_per_post: int = 30
+    max_total_chars: int = 14000
+    sleep_between_llm_calls_sec: float = 1.0
+
+
+def load_config() -> Config:
+    try:
+        from dotenv import load_dotenv  # optional when running outside FastAPI
+
+        load_dotenv(dotenv_path=REPO_ROOT / ".env", override=True)
+    except Exception:
+        pass
+
+    def _env_bool(name: str, default: str = "1") -> bool:
+        v = (os.getenv(name, default) or "").strip().lower()
+        return v in {"1", "true", "yes", "y", "on"}
+
+    data_dir_env = (os.getenv("DATA_DIR") or "data").strip()
+    data_dir = Path(data_dir_env).expanduser()
+    if not data_dir.is_absolute():
+        data_dir = (REPO_ROOT / data_dir).resolve()
+
+    return Config(
+        data_dir=data_dir,
+        firecrawl_api_key=os.getenv("FIRECRAWL_API_KEY"),
+        apify_token=os.getenv("APIFY_TOKEN"),
+        apify_actor_id=os.getenv("APIFY_ACTOR_ID", "oAuCIx3ItNrs2okjQ"),
+        perplexity_api_key=os.getenv("PERPLEXITY_API_KEY"),
+        perplexity_model=os.getenv("PERPLEXITY_MODEL", "sonar"),
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        openai_organization=os.getenv("OPENAI_ORG") or os.getenv("OPENAI_ORGANIZATION"),
+        openai_project=os.getenv("OPENAI_PROJECT"),
+        gemini_api_key=os.getenv("GEMINI_API_KEY"),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        tbs=os.getenv("SCRAPE_TBS", "qdr:d"),
+        limit=int(os.getenv("FIRECRAWL_LIMIT", "10")),
+        apify_max_urls=int(os.getenv("APIFY_MAX_URLS", "60")),
+        max_urls=int(os.getenv("MAX_URLS", "300")),
+        use_hits_cache=_env_bool("USE_HITS_CACHE", "0"),
+        hits_max_age_hours=float(os.getenv("HITS_MAX_AGE_HOURS", "24")),
+        batch_size=int(os.getenv("BATCH_SIZE", "20")),
+        sleep_between_llm_calls_sec=float(
+            os.getenv("SLEEP_BETWEEN_LLM_CALLS_SEC") or os.getenv("SLEEP_BETWEEN_GEMINI_CALLS_SEC") or "1.0"
+        ),
+    )
+
+
+def _stable_id_from_hit(url: str, title: str, snippet: str) -> str:
+    raw = (url + title + snippet).encode("utf-8", "ignore")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _extract_firecrawl_results(resp_json: dict) -> list[dict]:
+    data = resp_json.get("data", {})
+    if isinstance(data, dict):
+        web_results = data.get("web")
+        if isinstance(web_results, list):
+            return web_results
+    return []
+
+
+def _post_with_backoff(headers: dict, payload: dict, max_retries: int = 8) -> requests.Response:
+    for attempt in range(max_retries):
+        r = requests.post(FIRECRAWL_URL, json=payload, headers=headers, timeout=60)
+        if r.status_code == 200:
+            return r
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            wait: float | None = None
+            if retry_after:
+                try:
+                    wait = float(retry_after)
+                except Exception:
+                    wait = None
+            if wait is None:
+                wait = min(60.0, (2.0**attempt)) + random.uniform(0.6, 1.6)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+    raise RuntimeError("Exceeded retries due to repeated 429 rate limits.")
+
+
+def firecrawl_collect_hits(cfg: Config, queries: list[str]) -> Path:
+    if not cfg.firecrawl_api_key:
+        raise RuntimeError("Missing FIRECRAWL_API_KEY in environment.")
+
+    ensure_dir(cfg.data_dir)
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    hits_csv = cfg.data_dir / f"firecrawl_hits_{day}.csv"
+
+    fieldnames = ["ts_utc", "query", "title", "url", "snippet", "position", "stable_id"]
+    ensure_csv_has_header(hits_csv, fieldnames)
+
+    # load seen IDs (avoid duplicates on rerun)
+    seen: set[str] = set()
+    if hits_csv.exists() and hits_csv.stat().st_size > 0:
+        with hits_csv.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sid = (row.get("stable_id") or "").strip()
+                if sid:
+                    seen.add(sid)
+
+    headers = {"Authorization": f"Bearer {cfg.firecrawl_api_key}", "Content-Type": "application/json"}
+    base_payload = {
+        "sources": ["web"],
+        "categories": [],
+        "tbs": cfg.tbs,
+        "limit": cfg.limit,
+        "scrapeOptions": {"onlyMainContent": False, "maxAge": 172800000, "parsers": ["pdf"], "formats": []},
+    }
+
+    new_rows: list[dict] = []
+    for q in queries:
+        payload = dict(base_payload)
+        payload["query"] = q
+        time.sleep(random.uniform(0.8, 1.8))
+        resp = _post_with_backoff(headers, payload).json()
+        results = _extract_firecrawl_results(resp)
+        for item in results:
+            url = item.get("url") or ""
+            title = item.get("title") or ""
+            snippet = item.get("description") or ""
+            sid = _stable_id_from_hit(url, title, snippet)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            new_rows.append(
+                {
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "query": q,
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet,
+                    "position": item.get("position"),
+                    "stable_id": sid,
+                }
+            )
+
+    append_rows(hits_csv, fieldnames, new_rows)
+    return hits_csv
+
+
+def _hits_csv_path(cfg: Config) -> Path:
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return cfg.data_dir / f"firecrawl_hits_{day}.csv"
+
+
+def _is_recent_file(path: Path, max_age_hours: float) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    age_sec = max(0.0, time.time() - path.stat().st_mtime)
+    return age_sec <= max_age_hours * 3600.0
+
+
+def _normalize_reddit_url(url: str) -> str:
+    url = (url or "").strip()
+    url = url.split("?")[0]
+    url = url.replace("old.reddit.com", "www.reddit.com")
+    return url
+
+
+_EXCLUDED_REDDIT_PATH_PREFIXES = [
+    "/r/digitalnomad",
+]
+
+
+def _is_excluded_reddit_url(url: str) -> bool:
+    u = (url or "").lower()
+    if "reddit.com" not in u:
+        return False
+    path = u.split("reddit.com", 1)[1]
+    return any(prefix in path for prefix in _EXCLUDED_REDDIT_PATH_PREFIXES)
+
+
+def _is_reddit_post_or_comment_url(url: str) -> bool:
+    u = (url or "").lower()
+    if "reddit.com" not in u:
+        return False
+    # Permalinks to posts/comments contain /comments/<post_id>/...
+    return "/comments/" in u
+
+
+def _read_unique_urls_from_hits_csv(path: Path) -> list[str]:
+    urls: list[str] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            u = _normalize_reddit_url(row.get("url", ""))
+            if u:
+                urls.append(u)
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _chunks(lst: list[str], n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= max_chars else text[:max_chars] + "…"
+
+
+def _run_apify_batch(cfg: Config, urls: list[str], status_cb: Callable[..., None] | None = None) -> list[dict]:
+    if not cfg.apify_token:
+        return []
+    try:
+        from apify_client import ApifyClient
+    except Exception:
+        return []
+
+    apify = ApifyClient(cfg.apify_token)
+    run_input = {
+        "startUrls": [{"url": u} for u in urls],
+        "ignoreStartUrls": False,
+        "searches": [],
+        "skipComments": False,
+        "skipUserPosts": True,
+        "skipCommunity": True,
+        "searchPosts": False,
+        "searchComments": False,
+        "searchCommunities": False,
+        "searchUsers": False,
+        "includeNSFW": True,
+        "sort": "new",
+        "maxPostCount": len(urls),
+        "maxComments": cfg.max_comments_per_post,
+        "maxItems": 5000,
+        "scrollTimeout": 40,
+        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+        "debugMode": False,
+    }
+    try:
+        run = apify.actor(cfg.apify_actor_id).call(run_input=run_input)
+        dataset_id = run["defaultDatasetId"]
+        return list(apify.dataset(dataset_id).iterate_items())
+    except Exception as e:
+        if status_cb:
+            status_cb(stage="apify", stage_detail=f"Apify error: {type(e).__name__}: {e}")
+        return []
+
+
+def _group_items(items: list[dict]) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    from collections import defaultdict
+
+    posts: dict[str, dict] = {}
+    comments_by_post: dict[str, list[dict]] = defaultdict(list)
+    for it in items:
+        if it.get("dataType") == "post":
+            pid = it.get("id")
+            if pid:
+                posts[str(pid)] = it
+        elif it.get("dataType") == "comment":
+            pid = it.get("postId")
+            if pid:
+                comments_by_post[str(pid)].append(it)
+    return posts, comments_by_post
+
+
+def _build_thread_text(cfg: Config, post: dict, comments: list[dict]) -> str:
+    url = post.get("url") or post.get("link") or ""
+    title = post.get("title", "")
+    body = post.get("body", "")
+
+    comments_sorted = sorted(comments, key=lambda c: c.get("upVotes") or 0, reverse=True)[: cfg.max_comments_per_post]
+    parts = [f"URL: {url}", f"TITLE: {title}", "POST:", body, "", "COMMENTS:"]
+    for i, c in enumerate(comments_sorted, 1):
+        parts.append(f"{i}. @{c.get('username','')}: {c.get('body','')}")
+        parts.append(f"   ({c.get('url','')})")
+    return _truncate("\n".join(parts), cfg.max_total_chars)
+
+
+def _extract_json_loose(text: str) -> dict:
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        raise ValueError("No JSON object found in model output.")
+    return json.loads(m.group(0))
+
+
+def _gemini_classify(cfg: Config, thread_text: str) -> dict:
+    if not cfg.gemini_api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY.")
+    from google import genai
+
+    gemini = genai.Client(api_key=cfg.gemini_api_key)
+    prompt = f"""
+You are a strict lead qualifier for luxury intent on Reddit.
+
+Decide if the thread contains a VALID actionable lead in any of:
+- real_estate (buyer/seller/renter/broker/agent request)
+- luxury_car (buy/lease/import/rent/dealer request)
+- luxury_watch (buy/sell/dealer/AD/waitlist/grey-market request)
+- yacht (charter/buy/berth/broker request)
+- private_jet (charter/buy/fractional ownership request)
+
+Return ONLY JSON with these keys:
+{{
+  "is_lead": true/false,
+  "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
+  "lead_type": "buyer" | "seller" | "renter" | "broker" | "other" | "not_lead",
+  "market": "Dubai/Qatar/Spain/..." or "",
+  "confidence": number between 0 and 1,
+  "reason": "short explanation",
+  "evidence": "short excerpt proving intent"
+}}
+
+THREAD:
+\"\"\"{thread_text}\"\"\"
+""".strip()
+
+    resp = gemini.models.generate_content(model=cfg.gemini_model, contents=prompt)
+    data = _extract_json_loose(getattr(resp, "text", "") or "")
+    data.setdefault("is_lead", False)
+    data.setdefault("vertical", "not_lead")
+    data.setdefault("lead_type", "not_lead")
+    data.setdefault("market", "")
+    data.setdefault("confidence", 0.0)
+    data.setdefault("reason", "")
+    data.setdefault("evidence", "")
+    return data
+
+
+def _openai_classify(cfg: Config, thread_text: str) -> dict:
+    if not cfg.openai_api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY.")
+    from openai import OpenAI
+
+    timeout_sec = float(os.getenv("OPENAI_TIMEOUT_SEC", "60"))
+    client = OpenAI(
+        api_key=cfg.openai_api_key,
+        organization=cfg.openai_organization,
+        project=cfg.openai_project,
+        timeout=timeout_sec,
+        max_retries=2,
+    )
+    prompt = f"""
+You are a strict lead qualifier for luxury intent on Reddit.
+
+Decide if the thread contains a VALID actionable lead in any of:
+- real_estate (buyer/seller/renter/broker/agent request)
+- luxury_car (buy/lease/import/rent/dealer request)
+- luxury_watch (buy/sell/dealer/AD/waitlist/grey-market request)
+- yacht (charter/buy/berth/broker request)
+- private_jet (charter/buy/fractional ownership request)
+
+Return ONLY JSON with these keys:
+{{
+  "is_lead": true/false,
+  "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
+  "lead_type": "buyer" | "seller" | "renter" | "broker" | "other" | "not_lead",
+  "market": "Dubai/Qatar/Spain/..." or "",
+  "confidence": number between 0 and 1,
+  "reason": "short explanation",
+  "evidence": "short excerpt proving intent"
+}}
+
+THREAD:
+\"\"\"{thread_text}\"\"\"
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=cfg.openai_model,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON (no markdown, no commentary)."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+    except Exception:
+        resp = client.chat.completions.create(
+            model=cfg.openai_model,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON (no markdown, no commentary)."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+
+    text = ""
+    try:
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        text = ""
+
+    data = _extract_json_loose(text)
+    data.setdefault("is_lead", False)
+    data.setdefault("vertical", "not_lead")
+    data.setdefault("lead_type", "not_lead")
+    data.setdefault("market", "")
+    data.setdefault("confidence", 0.0)
+    data.setdefault("reason", "")
+    data.setdefault("evidence", "")
+    return data
+
+
+def _perplexity_classify(cfg: Config, url: str, title: str, snippet: str, query: str) -> dict:
+    if not cfg.perplexity_api_key:
+        raise RuntimeError("Missing PERPLEXITY_API_KEY.")
+
+    master_prompt = (os.getenv("PERPLEXITY_MASTER_PROMPT") or "").strip()
+    if not master_prompt:
+        master_prompt = """
+You are a strict lead qualifier for luxury intent on Reddit.
+
+Given a Reddit URL (post or comment permalink) and minimal context, decide if it contains a VALID actionable lead in any of:
+- real_estate (buyer/seller/renter/broker/agent request)
+- luxury_car (buy/lease/import/rent/dealer request)
+- luxury_watch (buy/sell/dealer/AD/waitlist/grey-market request)
+- yacht (charter/buy/berth/broker request)
+- private_jet (charter/buy/fractional ownership request)
+
+Hard rules:
+- If the content is NOT about these verticals (e.g. workplace drama, legal/HR issues, tech support, relationships, health, etc.), return not_lead.
+- Do NOT infer a vertical from vibes. Only classify a lead when there is explicit intent (buy/sell/rent/charter/looking for/need recommendations).
+- "Rent", "lease", and "charter" are NOT "buyer" → use lead_type "renter".
+- Evidence must be a short direct quote from the provided context (not invented). If you cannot quote intent, return not_lead.
+
+Return ONLY JSON with these keys:
+{
+  "is_lead": true/false,
+  "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
+  "lead_type": "buyer" | "seller" | "renter" | "broker" | "other" | "not_lead",
+  "market": "Dubai/Qatar/Spain/..." or "",
+  "confidence": number between 0 and 1,
+  "reason": "short explanation",
+  "evidence": "short excerpt proving intent"
+}
+""".strip()
+
+    base_url = (os.getenv("PERPLEXITY_BASE_URL") or "https://api.perplexity.ai").rstrip("/")
+    endpoint = f"{base_url}/chat/completions"
+    headers = {"Authorization": f"Bearer {cfg.perplexity_api_key}", "Content-Type": "application/json"}
+    user_payload = f"""
+{master_prompt}
+
+INPUT:
+URL: {url}
+TITLE: {title}
+SNIPPET: {snippet}
+QUERY: {query}
+""".strip()
+
+    payload = {
+        "model": cfg.perplexity_model,
+        "messages": [
+            {"role": "system", "content": "Return only valid JSON (no markdown, no commentary)."},
+            {"role": "user", "content": user_payload},
+        ],
+        "temperature": 0.2,
+    }
+
+    r = requests.post(endpoint, headers=headers, json=payload, timeout=90)
+    r.raise_for_status()
+    data_json = r.json()
+    content = (((data_json.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    data = _extract_json_loose(content)
+    data.setdefault("is_lead", False)
+    data.setdefault("vertical", "not_lead")
+    data.setdefault("lead_type", "not_lead")
+    data.setdefault("market", "")
+    data.setdefault("confidence", 0.0)
+    data.setdefault("reason", "")
+    data.setdefault("evidence", "")
+    return data
+
+
+def _validate_verdict(cfg: Config, verdict: dict, source_text: str, market_hint: str = "") -> dict:
+    v = dict(verdict or {})
+
+    is_lead = bool(v.get("is_lead"))
+    vertical = str(v.get("vertical") or "not_lead")
+    lead_type = str(v.get("lead_type") or "not_lead")
+    market = str(v.get("market") or market_hint or "")
+    reason = str(v.get("reason") or "")
+    evidence = str(v.get("evidence") or "")
+
+    try:
+        confidence = float(v.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    src = (source_text or "").strip()
+    src_lower = src.lower()
+
+    # If the model provides "evidence", it must be present in the provided text; otherwise treat as hallucination.
+    ev = (evidence or "").strip()
+    if ev and ev.lower() not in src_lower:
+        return {
+            "is_lead": False,
+            "vertical": "not_lead",
+            "lead_type": "not_lead",
+            "market": market_hint or "",
+            "confidence": 0.0,
+            "reason": "Forced not_lead: evidence not found in input context.",
+            "evidence": "",
+        }
+
+    # Prevent obvious false positives: require some vertical hint if a lead is claimed.
+    if vertical not in {"not_lead", "other"} or is_lead:
+        has_hint = any(h in src_lower for hints in _VERTICAL_HINTS.values() for h in hints)
+        if not has_hint and "/comments/" not in src_lower:
+            return {
+                "is_lead": False,
+                "vertical": "not_lead",
+                "lead_type": "not_lead",
+                "market": market_hint or "",
+                "confidence": 0.0,
+                "reason": "Forced not_lead: no luxury vertical evidence in provided context.",
+                "evidence": "",
+            }
+
+    # Normalize rent/charter to renter.
+    rental_tokens = [" rent", " rental", " lease", " leasing", " charter", " short term"]
+    if lead_type == "buyer" and any(tok in f" {src_lower} " for tok in rental_tokens):
+        lead_type = "renter"
+
+    # Ensure not_lead consistency.
+    if vertical == "not_lead" or lead_type == "not_lead":
+        is_lead = False
+        vertical = "not_lead"
+        lead_type = "not_lead"
+        confidence = min(confidence, 0.25)
+
+    return {
+        "is_lead": bool(is_lead),
+        "vertical": vertical,
+        "lead_type": lead_type,
+        "market": market,
+        "confidence": confidence,
+        "reason": reason,
+        "evidence": evidence,
+    }
+
+
+def _classifier_label(cfg: Config) -> str:
+    if cfg.perplexity_api_key:
+        return f"perplexity:{cfg.perplexity_model}"
+    if cfg.openai_api_key:
+        return f"openai:{cfg.openai_model}"
+    if cfg.gemini_api_key:
+        return f"gemini:{cfg.gemini_model}"
+    return "heuristic"
+
+
+_INTENT_WORDS = {
+    "buyer": ["looking to buy", "buying", "purchase", "buy", "budget", "mortgage", "lease", "financing"],
+    "seller": ["selling", "sell", "listing", "for sale", "offloading"],
+    "renter": ["rent", "rental", "lease", "tenant", "short term"],
+    "broker": ["recommend", "recommendation", "agent", "broker", "dealer", "where to buy", "who to contact", "ad"],
+}
+
+_VERTICAL_HINTS = {
+    "luxury_car": ["ferrari", "lamborghini", "rolls", "rolls-royce", "bugatti", "mclaren", "supercar", "dealer"],
+    "luxury_watch": ["rolex", "patek", "audemars", "ap", "richard mille", "nautilus", "daytona", "submariner", "ad"],
+    "yacht": ["yacht", "superyacht", "charter", "marina berth", "berth"],
+    "private_jet": ["private jet", "gulfstream", "netjets", "fractional", "jet charter"],
+    "real_estate": ["apartment", "villa", "property", "real estate", "broker", "agent", "penthouse", "off plan"],
+}
+
+
+def _heuristic_classify(text: str, market_hint: str = "") -> dict:
+    t = (text or "").lower()
+    vertical = "other"
+    for v, hints in _VERTICAL_HINTS.items():
+        if any(h in t for h in hints):
+            vertical = v
+            break
+
+    lead_type = "other"
+    for lt, words in _INTENT_WORDS.items():
+        if any(w in t for w in words):
+            lead_type = lt
+            break
+
+    is_lead = vertical != "other" and lead_type in {"buyer", "seller", "renter", "broker"}
+    return {
+        "is_lead": bool(is_lead),
+        "vertical": vertical if is_lead else "not_lead",
+        "lead_type": lead_type if is_lead else "not_lead",
+        "market": market_hint or "",
+        "confidence": 0.65 if is_lead else 0.25,
+        "reason": "Heuristic classification (no Gemini key configured)." if is_lead else "No clear actionable intent found.",
+        "evidence": _truncate(text, 280),
+    }
+
+
+def _market_hint_from_url_or_query(url: str, query: str) -> str:
+    u = (url or "").lower()
+    q = (query or "").lower()
+    for token, market in [
+        ("/r/dubai", "Dubai"),
+        ("/r/abudhabi", "Abu Dhabi"),
+        ("/r/qatar", "Qatar"),
+        ("/r/saudi", "Saudi"),
+        ("/r/london", "London"),
+        ("/r/miami", "Miami"),
+        ("/r/losangeles", "Los Angeles"),
+        ("/r/nyc", "New York"),
+        ("/r/spain", "Spain"),
+        ("costa del sol", "Spain"),
+        ("marbella", "Spain"),
+        ("barcelona", "Spain"),
+        ("madrid", "Spain"),
+        ("monaco", "Monaco"),
+    ]:
+        if token in u or token in q:
+            return market
+    return ""
+
+
+def run_once(
+    cfg: Config | None = None,
+    status_cb: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    cfg = cfg or load_config()
+    ensure_dir(cfg.data_dir)
+
+    queries = get_queries()
+    hits_csv = _hits_csv_path(cfg)
+    if cfg.use_hits_cache and _is_recent_file(hits_csv, cfg.hits_max_age_hours):
+        if status_cb:
+            status_cb(stage="firecrawl", stage_detail=f"Using cached hits: {hits_csv}")
+    else:
+        if status_cb:
+            status_cb(stage="firecrawl", stage_detail=f"Firecrawl: {len(queries)} queries (tbs={cfg.tbs})")
+        hits_csv = firecrawl_collect_hits(cfg, queries)
+        if status_cb:
+            status_cb(stage="firecrawl", stage_detail=f"Firecrawl done: {hits_csv}")
+    urls = _read_unique_urls_from_hits_csv(hits_csv)
+    before_filter = len(urls)
+    urls = [u for u in urls if _is_reddit_post_or_comment_url(u) and not _is_excluded_reddit_url(u)]
+    if cfg.max_urls > 0 and len(urls) > cfg.max_urls:
+        urls = urls[: cfg.max_urls]
+    if status_cb:
+        dropped = before_filter - len(urls)
+        status_cb(stage="urls", stage_detail=f"Using {len(urls)} post/comment URLs (dropped {dropped} excluded/non-post)")
+
+    url_meta: dict[str, dict] = {}
+    with hits_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            u = _normalize_reddit_url(row.get("url", ""))
+            if not u or not _is_reddit_post_or_comment_url(u) or _is_excluded_reddit_url(u):
+                continue
+            url_meta.setdefault(
+                u,
+                {"query": row.get("query", ""), "title": row.get("title", ""), "snippet": row.get("snippet", "")},
+            )
+
+    all_out = cfg.data_dir / "all_results.csv"
+    leads_out = cfg.data_dir / "leads_only.csv"
+    fieldnames = [
+        "ts_utc",
+        "query",
+        "post_id",
+        "url",
+        "title",
+        "vertical",
+        "is_lead",
+        "lead_type",
+        "market",
+        "confidence",
+        "reason",
+        "evidence",
+    ]
+
+    total_count = 0
+    leads_count = 0
+
+    # Stream writes so the UI/CSV updates during a run.
+    with all_out.open("w", newline="", encoding="utf-8") as all_f, leads_out.open("w", newline="", encoding="utf-8") as leads_f:
+        all_w = csv.DictWriter(all_f, fieldnames=fieldnames)
+        leads_w = csv.DictWriter(leads_f, fieldnames=fieldnames)
+        all_w.writeheader()
+        leads_w.writeheader()
+        all_f.flush()
+        leads_f.flush()
+
+        def _write_row(row: dict) -> None:
+            nonlocal total_count, leads_count
+            all_w.writerow(row)
+            all_f.flush()
+            total_count += 1
+            if bool(row.get("is_lead")):
+                leads_w.writerow(row)
+                leads_f.flush()
+                leads_count += 1
+
+        apify_urls: list[str] = []
+        remaining_urls: list[str] = urls
+        if cfg.perplexity_api_key:
+            apify_urls = []
+            remaining_urls = urls
+        apify_import_ok = True
+        if cfg.apify_token:
+            try:
+                import apify_client  # noqa: F401
+            except Exception as e:
+                apify_import_ok = False
+                if status_cb:
+                    status_cb(stage="apify", stage_detail=f"Apify disabled (import error): {type(e).__name__}: {e}")
+
+        if (not cfg.perplexity_api_key) and cfg.apify_token and apify_import_ok and cfg.apify_max_urls > 0:
+            apify_urls = urls[: cfg.apify_max_urls]
+            remaining_urls = urls[cfg.apify_max_urls :]
+
+        if apify_urls:
+            if status_cb:
+                status_cb(stage="apify", stage_detail=f"Apify scraping {len(apify_urls)} URLs (cap={cfg.apify_max_urls}).")
+            for batch_urls in _chunks(apify_urls, cfg.batch_size):
+                if status_cb:
+                    status_cb(stage="apify", stage_detail=f"Apify scraping batch: {len(batch_urls)} URLs")
+                items = _run_apify_batch(cfg, batch_urls, status_cb=status_cb)
+                if not items:
+                    # Token/permissions/actor issues: fall back to title+snippet classification for these URLs.
+                    if status_cb:
+                        status_cb(stage="apify", stage_detail="Apify failed for this batch; falling back to title/snippet.")
+                    remaining_urls = batch_urls + remaining_urls
+                    continue
+                posts, comments_by_post = _group_items(items)
+                if status_cb:
+                    status_cb(stage="classify", stage_detail=f"Classifying 0/{len(posts)} posts (classifier={_classifier_label(cfg)})")
+                completed = 0
+                for post_id, post in posts.items():
+                    thread_text = _build_thread_text(cfg, post, comments_by_post.get(post_id, []))
+                    url = _normalize_reddit_url(post.get("url") or post.get("link") or "")
+                    meta = url_meta.get(url, {})
+                    market_hint = _market_hint_from_url_or_query(url, meta.get("query", ""))
+                    title = post.get("title") or meta.get("title") or ""
+                    query = meta.get("query", "")
+                    try:
+                        if cfg.perplexity_api_key:
+                            verdict = _perplexity_classify(cfg, url, title, meta.get("snippet", ""), query)
+                        elif cfg.openai_api_key:
+                            verdict = _openai_classify(cfg, thread_text)
+                        elif cfg.gemini_api_key:
+                            verdict = _gemini_classify(cfg, thread_text)
+                        else:
+                            verdict = _heuristic_classify(
+                                f"{title}\n{meta.get('snippet','')}\n{thread_text}", market_hint=market_hint
+                            )
+                    except Exception as e:
+                        verdict = {
+                            "is_lead": False,
+                            "vertical": "not_lead",
+                            "lead_type": "not_lead",
+                            "market": market_hint,
+                            "confidence": 0.0,
+                            "reason": f"Classifier error: {type(e).__name__}: {e}",
+                            "evidence": "",
+                        }
+                    source_text = f"{title}\n{meta.get('snippet','')}\n{thread_text}"
+                    verdict = _validate_verdict(cfg, verdict, source_text, market_hint=market_hint)
+
+                    _write_row(
+                        {
+                            "ts_utc": datetime.now(timezone.utc).isoformat(),
+                            "query": query,
+                            "post_id": str(post_id),
+                            "url": url,
+                            "title": title,
+                            "vertical": verdict.get("vertical", "not_lead"),
+                            "is_lead": bool(verdict.get("is_lead")),
+                            "lead_type": verdict.get("lead_type", "not_lead"),
+                            "market": verdict.get("market", market_hint),
+                            "confidence": verdict.get("confidence", 0.0),
+                            "reason": verdict.get("reason", ""),
+                            "evidence": verdict.get("evidence", ""),
+                        }
+                    )
+                    time.sleep(cfg.sleep_between_llm_calls_sec)
+                    completed += 1
+                    if status_cb and (completed % 5 == 0 or completed == len(posts)):
+                        status_cb(
+                            stage="classify",
+                            stage_detail=f"Classifying {completed}/{len(posts)} posts (classifier={_classifier_label(cfg)})",
+                        )
+
+        if remaining_urls:
+            if status_cb:
+                status_cb(
+                    stage="classify",
+                    stage_detail=f"Classifying 0/{len(remaining_urls)} URLs from title/snippet (classifier={_classifier_label(cfg)}).",
+                )
+            completed = 0
+            for url in remaining_urls:
+                meta = url_meta.get(url, {})
+                title = meta.get("title", "")
+                snippet = meta.get("snippet", "")
+                query = meta.get("query", "")
+                market_hint = _market_hint_from_url_or_query(url, query)
+                combined = f"URL: {url}\nTITLE: {title}\nSNIPPET: {snippet}\nQUERY: {query}"
+                try:
+                    if cfg.perplexity_api_key:
+                        verdict = _perplexity_classify(cfg, url, title, snippet, query)
+                    elif cfg.openai_api_key:
+                        verdict = _openai_classify(cfg, combined)
+                    elif cfg.gemini_api_key:
+                        verdict = _gemini_classify(cfg, combined)
+                    else:
+                        verdict = _heuristic_classify(combined, market_hint=market_hint)
+                except Exception as e:
+                    verdict = {
+                        "is_lead": False,
+                        "vertical": "not_lead",
+                        "lead_type": "not_lead",
+                        "market": market_hint,
+                        "confidence": 0.0,
+                        "reason": f"Classifier error: {type(e).__name__}: {e}",
+                        "evidence": "",
+                    }
+                verdict = _validate_verdict(cfg, verdict, combined, market_hint=market_hint)
+                _write_row(
+                    {
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                        "query": query,
+                        "post_id": _stable_id_from_hit(url, title, snippet),
+                        "url": url,
+                        "title": title,
+                        "vertical": verdict.get("vertical", "not_lead"),
+                        "is_lead": bool(verdict.get("is_lead")),
+                        "lead_type": verdict.get("lead_type", "not_lead"),
+                        "market": verdict.get("market", market_hint),
+                        "confidence": verdict.get("confidence", 0.0),
+                        "reason": verdict.get("reason", ""),
+                        "evidence": verdict.get("evidence", ""),
+                    }
+                )
+                completed += 1
+                if status_cb and (completed % 10 == 0 or completed == len(remaining_urls)):
+                    status_cb(
+                        stage="classify",
+                        stage_detail=f"Classifying {completed}/{len(remaining_urls)} URLs from title/snippet (classifier={_classifier_label(cfg)}).",
+                    )
+                time.sleep(cfg.sleep_between_llm_calls_sec)
+
+        if status_cb:
+            status_cb(stage="write", stage_detail="Writing CSV outputs…")
+
+        return {
+            "hits_csv": str(hits_csv),
+            "all_out": str(all_out),
+            "leads_out": str(leads_out),
+            "leads": leads_count,
+            "total": total_count,
+        }
