@@ -123,6 +123,28 @@ h1 { margin: 0; font-size: 24px; letter-spacing: 0.2px; }
 .input::placeholder { color: #a1a6aa; }
 .hint { color: var(--muted); font-size: 12px; white-space: nowrap; }
 
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.toggle-label:hover { background: #f6f7f8; }
+.toggle-label input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
 .tableWrap {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -157,6 +179,7 @@ a:hover { text-decoration: underline; }
   .pill { background: #272729; }
   tr:hover td { background: #222324; }
   code { color: #c4c8cc; }
+  .toggle-label:hover { background: #272729; }
   body {
     background:
       radial-gradient(900px 500px at 15% 0%, rgba(255, 69, 0, 0.18), transparent 55%),

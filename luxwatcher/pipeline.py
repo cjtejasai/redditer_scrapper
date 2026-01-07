@@ -18,7 +18,8 @@ from luxwatcher.queries import get_queries
 from luxwatcher.storage import append_rows, ensure_csv_has_header, ensure_dir
 
 
-FIRECRAWL_URL = "https://api.firecrawl.dev/v2/search"
+FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
+FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v1/scrape"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -105,9 +106,9 @@ def _extract_firecrawl_results(resp_json: dict) -> list[dict]:
     return []
 
 
-def _post_with_backoff(headers: dict, payload: dict, max_retries: int = 8) -> requests.Response:
+def _post_with_backoff(url: str, headers: dict, payload: dict, max_retries: int = 8, timeout: int = 60) -> requests.Response:
     for attempt in range(max_retries):
-        r = requests.post(FIRECRAWL_URL, json=payload, headers=headers, timeout=60)
+        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
         if r.status_code == 200:
             return r
         if r.status_code == 429:
@@ -161,7 +162,7 @@ def firecrawl_collect_hits(cfg: Config, queries: list[str]) -> Path:
         payload = dict(base_payload)
         payload["query"] = q
         time.sleep(random.uniform(0.8, 1.8))
-        resp = _post_with_backoff(headers, payload).json()
+        resp = _post_with_backoff(FIRECRAWL_SEARCH_URL, headers, payload).json()
         results = _extract_firecrawl_results(resp)
         for item in results:
             url = item.get("url") or ""
@@ -187,6 +188,66 @@ def firecrawl_collect_hits(cfg: Config, queries: list[str]) -> Path:
     return hits_csv
 
 
+def firecrawl_scrape_url(cfg: Config, url: str, status_cb: Callable[..., None] | None = None) -> str | None:
+    """
+    Scrape a single URL using Firecrawl's /scrape endpoint.
+    Returns the full markdown content of the page, or None on failure.
+    """
+    if not cfg.firecrawl_api_key:
+        return None
+
+    headers = {"Authorization": f"Bearer {cfg.firecrawl_api_key}", "Content-Type": "application/json"}
+    payload = {
+        "url": url,
+        "formats": ["markdown"],
+        "onlyMainContent": True,
+        "waitFor": 2000,  # Wait 2s for JS to render
+    }
+
+    try:
+        resp = _post_with_backoff(FIRECRAWL_SCRAPE_URL, headers, payload, max_retries=3, timeout=90)
+        data = resp.json()
+
+        # Extract markdown from response
+        if data.get("success"):
+            content_data = data.get("data", {})
+            markdown = content_data.get("markdown", "")
+            if markdown:
+                return markdown
+
+        return None
+    except Exception as e:
+        if status_cb:
+            status_cb(stage="scrape", stage_detail=f"Scrape error for {url}: {type(e).__name__}")
+        return None
+
+
+def firecrawl_scrape_batch(
+    cfg: Config,
+    urls: list[str],
+    status_cb: Callable[..., None] | None = None
+) -> dict[str, str]:
+    """
+    Scrape multiple URLs using Firecrawl.
+    Returns a dict of {url: markdown_content}.
+    """
+    results: dict[str, str] = {}
+    total = len(urls)
+
+    for i, url in enumerate(urls):
+        if status_cb and (i % 5 == 0 or i == total - 1):
+            status_cb(stage="scrape", stage_detail=f"Scraping {i+1}/{total} URLs with Firecrawl")
+
+        content = firecrawl_scrape_url(cfg, url, status_cb)
+        if content:
+            results[url] = content
+
+        # Rate limiting - be gentle with the API
+        time.sleep(random.uniform(0.5, 1.0))
+
+    return results
+
+
 def _hits_csv_path(cfg: Config) -> Path:
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     return cfg.data_dir / f"firecrawl_hits_{day}.csv"
@@ -209,6 +270,14 @@ def _normalize_reddit_url(url: str) -> str:
 _EXCLUDED_REDDIT_PATH_PREFIXES = [
     "/r/digitalnomad",
 ]
+
+def _is_allowed_subreddit(url: str) -> bool:
+    """Check if URL is from a valid subreddit (no filtering)."""
+    u = (url or "").lower()
+    if "reddit.com" not in u:
+        return False
+    # Just check it has a subreddit pattern
+    return bool(re.search(r"/r/[^/]+", u))
 
 
 def _is_excluded_reddit_url(url: str) -> bool:
@@ -265,23 +334,21 @@ def _run_apify_batch(cfg: Config, urls: list[str], status_cb: Callable[..., None
     apify = ApifyClient(cfg.apify_token)
     run_input = {
         "startUrls": [{"url": u} for u in urls],
-        "ignoreStartUrls": False,
-        "searches": [],
         "skipComments": False,
-        "skipUserPosts": True,
-        "skipCommunity": True,
+        "skipUserPosts": False,
+        "skipCommunity": False,
+        "ignoreStartUrls": False,
         "searchPosts": False,
         "searchComments": False,
         "searchCommunities": False,
         "searchUsers": False,
-        "includeNSFW": True,
         "sort": "new",
+        "includeNSFW": True,
+        "maxItems": 10000,
         "maxPostCount": len(urls),
         "maxComments": cfg.max_comments_per_post,
-        "maxItems": 5000,
         "scrollTimeout": 40,
         "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-        "debugMode": False,
     }
     try:
         run = apify.actor(cfg.apify_actor_id).call(run_input=run_input)
@@ -394,18 +461,25 @@ def _openai_classify(cfg: Config, thread_text: str) -> dict:
     prompt = f"""
 You are a strict lead qualifier for luxury intent on Reddit.
 
-Decide if the thread contains a VALID actionable lead in any of:
-- real_estate (buyer/seller/renter/broker/agent request)
-- luxury_car (buy/lease/import/rent/dealer request)
-- luxury_watch (buy/sell/dealer/AD/waitlist/grey-market request)
-- yacht (charter/buy/berth/broker request)
-- private_jet (charter/buy/fractional ownership request)
+Based on the thread content, decide if it contains a VALID actionable lead in any of:
+- real_estate (buyer looking to BUY, seller/owner selling, or broker/agent)
+- luxury_car (buyer looking to BUY, seller selling, or dealer)
+- luxury_watch (buyer looking to BUY, seller selling, or dealer/AD)
+- yacht (buyer looking to BUY, seller selling, or broker)
+- private_jet (buyer looking to BUY, seller selling, or broker)
+
+Hard rules:
+- EXCLUDE renters: People looking to RENT, LEASE, or CHARTER are NOT leads. Return not_lead for them.
+- Only classify as lead if: someone wants to BUY, someone is SELLING/owns and selling, or someone is a BROKER/AGENT/DEALER.
+- Sellers and owners selling should be classified as lead_type "broker".
+- If the content is NOT about these verticals, return not_lead.
+- Evidence must be a short direct quote from the post content.
 
 Return ONLY JSON with these keys:
 {{
   "is_lead": true/false,
   "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
-  "lead_type": "buyer" | "seller" | "renter" | "broker" | "other" | "not_lead",
+  "lead_type": "buyer" | "broker" | "not_lead",
   "market": "Dubai/Qatar/Spain/..." or "",
   "confidence": number between 0 and 1,
   "reason": "short explanation",
@@ -462,24 +536,27 @@ def _perplexity_classify(cfg: Config, url: str, title: str, snippet: str, query:
         master_prompt = """
 You are a strict lead qualifier for luxury intent on Reddit.
 
-Given a Reddit URL (post or comment permalink) and minimal context, decide if it contains a VALID actionable lead in any of:
-- real_estate (buyer/seller/renter/broker/agent request)
-- luxury_car (buy/lease/import/rent/dealer request)
-- luxury_watch (buy/sell/dealer/AD/waitlist/grey-market request)
-- yacht (charter/buy/berth/broker request)
-- private_jet (charter/buy/fractional ownership request)
+Visit and read the FULL content of the Reddit URL provided (post body and comments). Based on the actual content, decide if it contains a VALID actionable lead in any of:
+- real_estate (buyer looking to BUY, seller/owner selling, or broker/agent)
+- luxury_car (buyer looking to BUY, seller selling, or dealer)
+- luxury_watch (buyer looking to BUY, seller selling, or dealer/AD)
+- yacht (buyer looking to BUY, seller selling, or broker)
+- private_jet (buyer looking to BUY, seller selling, or broker)
 
 Hard rules:
+- You MUST visit the URL and read the full post content and comments before classifying.
+- EXCLUDE renters: People looking to RENT, LEASE, or CHARTER are NOT leads. Return not_lead for them.
+- Only classify as lead if: someone wants to BUY, someone is SELLING/owns and selling, or someone is a BROKER/AGENT/DEALER.
+- Sellers and owners selling should be classified as lead_type "broker".
 - If the content is NOT about these verticals (e.g. workplace drama, legal/HR issues, tech support, relationships, health, etc.), return not_lead.
-- Do NOT infer a vertical from vibes. Only classify a lead when there is explicit intent (buy/sell/rent/charter/looking for/need recommendations).
-- "Rent", "lease", and "charter" are NOT "buyer" → use lead_type "renter".
-- Evidence must be a short direct quote from the provided context (not invented). If you cannot quote intent, return not_lead.
+- Do NOT infer a vertical from vibes. Only classify a lead when there is explicit intent to buy or sell.
+- Evidence must be a short direct quote from the post content (not invented). If you cannot quote intent, return not_lead.
 
 Return ONLY JSON with these keys:
 {
   "is_lead": true/false,
   "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
-  "lead_type": "buyer" | "seller" | "renter" | "broker" | "other" | "not_lead",
+  "lead_type": "buyer" | "broker" | "not_lead",
   "market": "Dubai/Qatar/Spain/..." or "",
   "confidence": number between 0 and 1,
   "reason": "short explanation",
@@ -493,11 +570,7 @@ Return ONLY JSON with these keys:
     user_payload = f"""
 {master_prompt}
 
-INPUT:
 URL: {url}
-TITLE: {title}
-SNIPPET: {snippet}
-QUERY: {query}
 """.strip()
 
     payload = {
@@ -507,6 +580,9 @@ QUERY: {query}
             {"role": "user", "content": user_payload},
         ],
         "temperature": 0.2,
+        "web_search_options": {
+            "search_context_size": "high"
+        },
     }
 
     r = requests.post(endpoint, headers=headers, json=payload, timeout=90)
@@ -594,10 +670,10 @@ def _validate_verdict(cfg: Config, verdict: dict, source_text: str, market_hint:
 
 
 def _classifier_label(cfg: Config) -> str:
-    if cfg.perplexity_api_key:
-        return f"perplexity:{cfg.perplexity_model}"
     if cfg.openai_api_key:
         return f"openai:{cfg.openai_model}"
+    if cfg.perplexity_api_key:
+        return f"perplexity:{cfg.perplexity_model}"
     if cfg.gemini_api_key:
         return f"gemini:{cfg.gemini_model}"
     return "heuristic"
@@ -617,6 +693,120 @@ _VERTICAL_HINTS = {
     "private_jet": ["private jet", "gulfstream", "netjets", "fractional", "jet charter"],
     "real_estate": ["apartment", "villa", "property", "real estate", "broker", "agent", "penthouse", "off plan"],
 }
+
+
+def _prefilter_batch(cfg: Config, items: list[dict], status_cb: Callable[..., None] | None = None) -> tuple[list[dict], list[dict]]:
+    """
+    Pre-filter hits using title/snippet before expensive Apify scraping.
+    Returns (certain_leads, needs_verification):
+    - certain_leads: High confidence leads from title/snippet alone
+    - needs_verification: Need to scrape full content to verify
+    """
+    if not cfg.openai_api_key:
+        # No OpenAI key - return all items as needing verification
+        return [], items
+
+    if not items:
+        return [], []
+
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=cfg.openai_api_key,
+        organization=cfg.openai_organization,
+        project=cfg.openai_project,
+        timeout=60,
+        max_retries=2,
+    )
+
+    # Process in batches of 20
+    batch_size = 20
+    certain_leads: list[dict] = []
+    needs_verification: list[dict] = []
+
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+
+        # Build prompt with all items in batch
+        items_text = ""
+        for idx, item in enumerate(batch):
+            title = item.get("title", "")[:200]
+            snippet = item.get("snippet", "")[:300]
+            items_text += f"\n{idx + 1}. Title: {title}\n   Snippet: {snippet}\n"
+
+        prompt = f"""You are a lead classifier for REAL ESTATE only. Review these Reddit post titles/snippets.
+
+ONLY classify as leads if about REAL ESTATE (buying/selling property, apartments, villas, houses).
+EXCLUDE: renters, tenants, people looking to rent/lease. We only want BUYERS and SELLERS.
+EXCLUDE: luxury cars, watches, yachts, jets - NOT relevant.
+
+For each item, classify as:
+- "certain_lead": Clear BUYING or SELLING property intent (e.g., "Looking to buy apartment", "Selling my villa")
+- "verify": Might be real estate buyer/seller but need full content to confirm
+- "not_lead": Renters, other topics, news, memes, complaints
+
+Items:
+{items_text}
+
+Return JSON:
+{{
+  "certain_leads": [{{"id": 1, "vertical": "real_estate", "lead_type": "buyer", "market": "Dubai"}}],
+  "verify": [2, 5],
+  "not_leads": [3, 4]
+}}
+
+For certain_leads, include: id, vertical (always "real_estate"), lead_type ("buyer" or "seller"), market (city/country).
+Be strict - only BUYING or SELLING property. Renters = not_lead."""
+
+        try:
+            resp = client.chat.completions.create(
+                model=cfg.openai_model,
+                messages=[
+                    {"role": "system", "content": "Return only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            data = _extract_json_loose(text)
+
+            for entry in data.get("certain_leads", []):
+                # Handle both formats: {"id": 1, "vertical": ...} or just 1
+                if isinstance(entry, dict):
+                    idx = entry.get("id")
+                    if isinstance(idx, int) and 1 <= idx <= len(batch):
+                        item = batch[idx - 1].copy()
+                        item["prefilter_status"] = "certain_lead"
+                        item["vertical"] = entry.get("vertical", "real_estate")
+                        item["lead_type"] = entry.get("lead_type", "buyer")
+                        item["market"] = entry.get("market", "")
+                        certain_leads.append(item)
+                elif isinstance(entry, int) and 1 <= entry <= len(batch):
+                    item = batch[entry - 1].copy()
+                    item["prefilter_status"] = "certain_lead"
+                    item["vertical"] = "real_estate"
+                    item["lead_type"] = "buyer"
+                    certain_leads.append(item)
+
+            for idx in data.get("verify", []):
+                if isinstance(idx, int) and 1 <= idx <= len(batch):
+                    item = batch[idx - 1].copy()
+                    item["prefilter_status"] = "verify"
+                    needs_verification.append(item)
+
+        except Exception as e:
+            # On error, mark all for verification (fail open)
+            if status_cb:
+                status_cb(stage="prefilter", stage_detail=f"Prefilter error: {type(e).__name__}, marking all for verification")
+            needs_verification.extend(batch)
+
+        if status_cb:
+            status_cb(stage="prefilter", stage_detail=f"Pre-filtered {min(i + batch_size, len(items))}/{len(items)}: {len(certain_leads)} certain, {len(needs_verification)} to verify")
+
+        time.sleep(0.5)  # Rate limit
+
+    return certain_leads, needs_verification
 
 
 def _heuristic_classify(text: str, market_hint: str = "") -> dict:
@@ -689,7 +879,7 @@ def run_once(
             status_cb(stage="firecrawl", stage_detail=f"Firecrawl done: {hits_csv}")
     urls = _read_unique_urls_from_hits_csv(hits_csv)
     before_filter = len(urls)
-    urls = [u for u in urls if _is_reddit_post_or_comment_url(u) and not _is_excluded_reddit_url(u)]
+    urls = [u for u in urls if _is_reddit_post_or_comment_url(u) and _is_allowed_subreddit(u) and not _is_excluded_reddit_url(u)]
     if cfg.max_urls > 0 and len(urls) > cfg.max_urls:
         urls = urls[: cfg.max_urls]
     if status_cb:
@@ -705,8 +895,25 @@ def run_once(
                 continue
             url_meta.setdefault(
                 u,
-                {"query": row.get("query", ""), "title": row.get("title", ""), "snippet": row.get("snippet", "")},
+                {"url": u, "query": row.get("query", ""), "title": row.get("title", ""), "snippet": row.get("snippet", "")},
             )
+
+    # Pre-filter using title/snippet before expensive Apify scraping
+    if status_cb:
+        status_cb(stage="prefilter", stage_detail=f"Pre-filtering {len(urls)} URLs with OpenAI...")
+
+    prefilter_items = [url_meta.get(u, {"url": u, "title": "", "snippet": ""}) for u in urls]
+    certain_leads, needs_verification = _prefilter_batch(cfg, prefilter_items, status_cb=status_cb)
+
+    if status_cb:
+        status_cb(stage="prefilter", stage_detail=f"Pre-filter done: {len(certain_leads)} certain leads, {len(needs_verification)} to verify, {len(urls) - len(certain_leads) - len(needs_verification)} discarded")
+
+    # Only scrape URLs that need verification - limit to 20 to save Apify credits
+    max_verify = 20
+    urls_to_scrape = [item.get("url") for item in needs_verification if item.get("url")][:max_verify]
+    if len(needs_verification) > max_verify:
+        if status_cb:
+            status_cb(stage="prefilter", stage_detail=f"Limiting verification to {max_verify} URLs (had {len(needs_verification)})")
 
     all_out = cfg.data_dir / "all_results.csv"
     leads_out = cfg.data_dir / "leads_only.csv"
@@ -747,153 +954,115 @@ def run_once(
                 leads_f.flush()
                 leads_count += 1
 
-        apify_urls: list[str] = []
-        remaining_urls: list[str] = urls
-        if cfg.perplexity_api_key:
-            apify_urls = []
-            remaining_urls = urls
-        apify_import_ok = True
-        if cfg.apify_token:
-            try:
-                import apify_client  # noqa: F401
-            except Exception as e:
-                apify_import_ok = False
-                if status_cb:
-                    status_cb(stage="apify", stage_detail=f"Apify disabled (import error): {type(e).__name__}: {e}")
+        # ============================================================
+        # Step 1: Write certain leads directly (no Apify needed)
+        # ============================================================
+        if status_cb:
+            status_cb(stage="certain", stage_detail=f"Adding {len(certain_leads)} certain leads directly...")
 
-        if (not cfg.perplexity_api_key) and cfg.apify_token and apify_import_ok and cfg.apify_max_urls > 0:
-            apify_urls = urls[: cfg.apify_max_urls]
-            remaining_urls = urls[cfg.apify_max_urls :]
+        for item in certain_leads:
+            url = item.get("url", "")
+            title = item.get("title", "")
+            query = item.get("query", "")
+            market_hint = item.get("market") or _market_hint_from_url_or_query(url, query)
 
-        if apify_urls:
+            _write_row({
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "query": query,
+                "post_id": "",
+                "url": url,
+                "title": title,
+                "vertical": item.get("vertical", "real_estate"),
+                "is_lead": True,
+                "lead_type": item.get("lead_type", "buyer"),
+                "market": market_hint,
+                "confidence": 0.85,
+                "reason": "Certain lead from title/snippet pre-filter",
+                "evidence": item.get("snippet", "")[:200],
+            })
+
+        # ============================================================
+        # Step 2: Scrape only URLs that need verification with Apify
+        # ============================================================
+        if urls_to_scrape:
             if status_cb:
-                status_cb(stage="apify", stage_detail=f"Apify scraping {len(apify_urls)} URLs (cap={cfg.apify_max_urls}).")
-            for batch_urls in _chunks(apify_urls, cfg.batch_size):
+                status_cb(stage="apify", stage_detail=f"Scraping {len(urls_to_scrape)} URLs with Apify...")
+
+            all_items: list[dict] = []
+            for batch_urls in _chunks(urls_to_scrape, cfg.apify_max_urls):
                 if status_cb:
-                    status_cb(stage="apify", stage_detail=f"Apify scraping batch: {len(batch_urls)} URLs")
+                    status_cb(stage="apify", stage_detail=f"Apify batch: {len(batch_urls)} URLs (total scraped: {len(all_items)} items)")
                 items = _run_apify_batch(cfg, batch_urls, status_cb=status_cb)
-                if not items:
-                    # Token/permissions/actor issues: fall back to title+snippet classification for these URLs.
-                    if status_cb:
-                        status_cb(stage="apify", stage_detail="Apify failed for this batch; falling back to title/snippet.")
-                    remaining_urls = batch_urls + remaining_urls
-                    continue
-                posts, comments_by_post = _group_items(items)
-                if status_cb:
-                    status_cb(stage="classify", stage_detail=f"Classifying 0/{len(posts)} posts (classifier={_classifier_label(cfg)})")
-                completed = 0
-                for post_id, post in posts.items():
-                    thread_text = _build_thread_text(cfg, post, comments_by_post.get(post_id, []))
-                    url = _normalize_reddit_url(post.get("url") or post.get("link") or "")
-                    meta = url_meta.get(url, {})
-                    market_hint = _market_hint_from_url_or_query(url, meta.get("query", ""))
-                    title = post.get("title") or meta.get("title") or ""
-                    query = meta.get("query", "")
-                    try:
-                        if cfg.perplexity_api_key:
-                            verdict = _perplexity_classify(cfg, url, title, meta.get("snippet", ""), query)
-                        elif cfg.openai_api_key:
-                            verdict = _openai_classify(cfg, thread_text)
-                        elif cfg.gemini_api_key:
-                            verdict = _gemini_classify(cfg, thread_text)
-                        else:
-                            verdict = _heuristic_classify(
-                                f"{title}\n{meta.get('snippet','')}\n{thread_text}", market_hint=market_hint
-                            )
-                    except Exception as e:
-                        verdict = {
-                            "is_lead": False,
-                            "vertical": "not_lead",
-                            "lead_type": "not_lead",
-                            "market": market_hint,
-                            "confidence": 0.0,
-                            "reason": f"Classifier error: {type(e).__name__}: {e}",
-                            "evidence": "",
-                        }
-                    source_text = f"{title}\n{meta.get('snippet','')}\n{thread_text}"
-                    verdict = _validate_verdict(cfg, verdict, source_text, market_hint=market_hint)
+                all_items.extend(items)
+        else:
+            all_items = []
 
-                    _write_row(
-                        {
-                            "ts_utc": datetime.now(timezone.utc).isoformat(),
-                            "query": query,
-                            "post_id": str(post_id),
-                            "url": url,
-                            "title": title,
-                            "vertical": verdict.get("vertical", "not_lead"),
-                            "is_lead": bool(verdict.get("is_lead")),
-                            "lead_type": verdict.get("lead_type", "not_lead"),
-                            "market": verdict.get("market", market_hint),
-                            "confidence": verdict.get("confidence", 0.0),
-                            "reason": verdict.get("reason", ""),
-                            "evidence": verdict.get("evidence", ""),
-                        }
-                    )
-                    time.sleep(cfg.sleep_between_llm_calls_sec)
-                    completed += 1
-                    if status_cb and (completed % 5 == 0 or completed == len(posts)):
-                        status_cb(
-                            stage="classify",
-                            stage_detail=f"Classifying {completed}/{len(posts)} posts (classifier={_classifier_label(cfg)})",
-                        )
+        posts, comments_by_post = _group_items(all_items)
 
-        if remaining_urls:
-            if status_cb:
+        if status_cb:
+            status_cb(stage="apify", stage_detail=f"Apify done: {len(posts)} posts, {sum(len(c) for c in comments_by_post.values())} comments")
+
+        # Step 2: Classify each post using OpenAI with full thread content
+        if status_cb:
+            status_cb(stage="classify", stage_detail=f"Classifying {len(posts)} posts (classifier={_classifier_label(cfg)})")
+
+        completed = 0
+        for pid, post in posts.items():
+            url = post.get("url") or post.get("link") or ""
+            title = post.get("title", "")
+            meta = url_meta.get(_normalize_reddit_url(url), {})
+            query = meta.get("query", "")
+            market_hint = _market_hint_from_url_or_query(url, query)
+
+            # Build thread text from post + comments
+            comments = comments_by_post.get(pid, [])
+            thread_text = _build_thread_text(cfg, post, comments)
+
+            try:
+                if cfg.openai_api_key:
+                    verdict = _openai_classify(cfg, thread_text)
+                elif cfg.gemini_api_key:
+                    verdict = _gemini_classify(cfg, thread_text)
+                else:
+                    verdict = _heuristic_classify(thread_text, market_hint=market_hint)
+            except Exception as e:
+                verdict = {
+                    "is_lead": False,
+                    "vertical": "not_lead",
+                    "lead_type": "not_lead",
+                    "market": market_hint,
+                    "confidence": 0.0,
+                    "reason": f"Classifier error: {type(e).__name__}: {e}",
+                    "evidence": "",
+                }
+
+            # Validate verdict against thread text
+            verdict = _validate_verdict(cfg, verdict, thread_text, market_hint=market_hint)
+
+            _write_row(
+                {
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "query": query,
+                    "post_id": pid,
+                    "url": url,
+                    "title": title,
+                    "vertical": verdict.get("vertical", "not_lead"),
+                    "is_lead": bool(verdict.get("is_lead")),
+                    "lead_type": verdict.get("lead_type", "not_lead"),
+                    "market": verdict.get("market", market_hint),
+                    "confidence": verdict.get("confidence", 0.0),
+                    "reason": verdict.get("reason", ""),
+                    "evidence": verdict.get("evidence", ""),
+                }
+            )
+
+            completed += 1
+            if status_cb and (completed % 5 == 0 or completed == len(posts)):
                 status_cb(
                     stage="classify",
-                    stage_detail=f"Classifying 0/{len(remaining_urls)} URLs from title/snippet (classifier={_classifier_label(cfg)}).",
+                    stage_detail=f"Classified {completed}/{len(posts)} posts (classifier={_classifier_label(cfg)})",
                 )
-            completed = 0
-            for url in remaining_urls:
-                meta = url_meta.get(url, {})
-                title = meta.get("title", "")
-                snippet = meta.get("snippet", "")
-                query = meta.get("query", "")
-                market_hint = _market_hint_from_url_or_query(url, query)
-                combined = f"URL: {url}\nTITLE: {title}\nSNIPPET: {snippet}\nQUERY: {query}"
-                try:
-                    if cfg.perplexity_api_key:
-                        verdict = _perplexity_classify(cfg, url, title, snippet, query)
-                    elif cfg.openai_api_key:
-                        verdict = _openai_classify(cfg, combined)
-                    elif cfg.gemini_api_key:
-                        verdict = _gemini_classify(cfg, combined)
-                    else:
-                        verdict = _heuristic_classify(combined, market_hint=market_hint)
-                except Exception as e:
-                    verdict = {
-                        "is_lead": False,
-                        "vertical": "not_lead",
-                        "lead_type": "not_lead",
-                        "market": market_hint,
-                        "confidence": 0.0,
-                        "reason": f"Classifier error: {type(e).__name__}: {e}",
-                        "evidence": "",
-                    }
-                verdict = _validate_verdict(cfg, verdict, combined, market_hint=market_hint)
-                _write_row(
-                    {
-                        "ts_utc": datetime.now(timezone.utc).isoformat(),
-                        "query": query,
-                        "post_id": _stable_id_from_hit(url, title, snippet),
-                        "url": url,
-                        "title": title,
-                        "vertical": verdict.get("vertical", "not_lead"),
-                        "is_lead": bool(verdict.get("is_lead")),
-                        "lead_type": verdict.get("lead_type", "not_lead"),
-                        "market": verdict.get("market", market_hint),
-                        "confidence": verdict.get("confidence", 0.0),
-                        "reason": verdict.get("reason", ""),
-                        "evidence": verdict.get("evidence", ""),
-                    }
-                )
-                completed += 1
-                if status_cb and (completed % 10 == 0 or completed == len(remaining_urls)):
-                    status_cb(
-                        stage="classify",
-                        stage_detail=f"Classifying {completed}/{len(remaining_urls)} URLs from title/snippet (classifier={_classifier_label(cfg)}).",
-                    )
-                time.sleep(cfg.sleep_between_llm_calls_sec)
+            time.sleep(cfg.sleep_between_llm_calls_sec)
 
         if status_cb:
             status_cb(stage="write", stage_detail="Writing CSV outputs…")

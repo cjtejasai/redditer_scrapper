@@ -133,9 +133,11 @@ async function refresh() {
   document.getElementById("leadsPath").textContent =
     meta?.outputs?.leads_out ?? status.leads_path ?? "—";
 
+  const showAll = document.getElementById("showAll").checked;
+  const includeAllParam = showAll ? "&include_all=true" : "";
   const leadsUrl = selectedRunId
-    ? `/api/leads?limit=500&run_id=${encodeURIComponent(selectedRunId)}`
-    : "/api/leads?limit=500";
+    ? `/api/leads?limit=500&run_id=${encodeURIComponent(selectedRunId)}${includeAllParam}`
+    : `/api/leads?limit=500${includeAllParam}`;
 
   const leads = await fetchJSON(leadsUrl);
   window.__leads = (leads.items ?? []).map((it) => ({
@@ -161,6 +163,7 @@ async function runNow() {
 document.getElementById("refresh").addEventListener("click", refresh);
 document.getElementById("runNow").addEventListener("click", runNow);
 document.getElementById("runSelect").addEventListener("change", refresh);
+document.getElementById("showAll").addEventListener("change", refresh);
 document.getElementById("filter").addEventListener("input", (e) => {
   renderRows(window.__leads ?? [], e.target.value);
 });

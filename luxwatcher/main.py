@@ -230,8 +230,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         state.shutdown.set()
+        task.cancel()
         try:
-            await asyncio.wait_for(task, timeout=10)
+            await task
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
 
@@ -289,15 +292,27 @@ async def api_run(background: BackgroundTasks):
 
 
 @app.get("/api/leads")
-def api_leads(limit: int = Query(200, ge=1, le=2000), run_id: str | None = None):
+def api_leads(
+    limit: int = Query(200, ge=1, le=2000),
+    run_id: str | None = None,
+    include_all: bool = Query(False, description="Include rejected leads (all results)")
+):
     cfg = load_config()
-    leads_csv = cfg.data_dir / "leads_only.csv"
+    # Choose file based on include_all flag
+    if include_all:
+        csv_file = cfg.data_dir / "all_results.csv"
+    else:
+        csv_file = cfg.data_dir / "leads_only.csv"
+
     if run_id:
         with state.status_lock:
             meta = next((m for m in state.run_history if m.get("run_id") == run_id), None)
         if meta:
-            p = (meta.get("outputs") or {}).get("leads_out") or (cfg.data_dir / "runs" / run_id / "leads_only.csv")
-            leads_csv = Path(str(p))
+            if include_all:
+                p = (meta.get("outputs") or {}).get("all_out") or (cfg.data_dir / "runs" / run_id / "all_results.csv")
+            else:
+                p = (meta.get("outputs") or {}).get("leads_out") or (cfg.data_dir / "runs" / run_id / "leads_only.csv")
+            csv_file = Path(str(p))
 
     def _confidence(it: dict) -> float:
         try:
@@ -305,11 +320,11 @@ def api_leads(limit: int = Query(200, ge=1, le=2000), run_id: str | None = None)
         except Exception:
             return 0.0
 
-    items = read_csv_dicts(leads_csv, limit=None)
+    items = read_csv_dicts(csv_file, limit=None)
     items = [it for it in items if not _is_excluded_url(it.get("url") or "")]
     items.sort(key=_confidence, reverse=True)
     items = items[:limit]
-    return {"items": items, "run_id": run_id}
+    return {"items": items, "run_id": run_id, "include_all": include_all}
 
 
 @app.get("/api/runs")
