@@ -162,6 +162,77 @@ a:hover { text-decoration: underline; }
 .nowrap { white-space: nowrap; }
 .small { color: var(--muted); font-size: 12px; }
 
+/* Buyer stage badges */
+.badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.badge-researching {
+  background: #e3f2fd;
+  color: #1565c0;
+  border: 1px solid #90caf9;
+}
+.badge-actively-looking {
+  background: #fff3e0;
+  color: #e65100;
+  border: 1px solid #ffb74d;
+}
+.badge-ready-to-buy {
+  background: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #81c784;
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge-researching {
+    background: #1a237e;
+    color: #90caf9;
+    border-color: #3949ab;
+  }
+  .badge-actively-looking {
+    background: #4a2c00;
+    color: #ffb74d;
+    border-color: #bf360c;
+  }
+  .badge-ready-to-buy {
+    background: #1b3d1e;
+    color: #81c784;
+    border-color: #2e7d32;
+  }
+}
+
+/* Download buttons */
+.download-actions {
+  display: flex;
+  gap: 8px;
+}
+.btn-download {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--link);
+  font-size: 13px;
+  padding: 8px 14px;
+}
+.btn-download:hover {
+  background: #e3f2fd;
+  border-color: var(--link);
+}
+
+/* Table cell styles for long content */
+.cell-evidence,
+.cell-reason,
+.cell-summary {
+  max-width: 300px;
+  white-space: normal;
+  word-wrap: break-word;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .footer { padding: 10px 2px 0; opacity: 0.9; }
 
 @media (prefers-color-scheme: dark) {
@@ -176,6 +247,7 @@ a:hover { text-decoration: underline; }
     --shadow-sm: 0 2px 14px rgba(0,0,0,0.40);
   }
   .btn:hover { background: #272729; }
+  .btn-download:hover { background: #1e3a5f; }
   .pill { background: #272729; }
   tr:hover td { background: #222324; }
   code { color: #c4c8cc; }

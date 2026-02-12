@@ -409,24 +409,34 @@ def _gemini_classify(cfg: Config, thread_text: str) -> dict:
 
     gemini = genai.Client(api_key=cfg.gemini_api_key)
     prompt = f"""
-You are a strict lead qualifier for luxury intent on Reddit.
+You are a strict lead qualifier for real estate buyer intent on Reddit.
 
-Decide if the thread contains a VALID actionable lead in any of:
-- real_estate (buyer/seller/renter/broker/agent request)
-- luxury_car (buy/lease/import/rent/dealer request)
-- luxury_watch (buy/sell/dealer/AD/waitlist/grey-market request)
-- yacht (charter/buy/berth/broker request)
-- private_jet (charter/buy/fractional ownership request)
+Analyze the thread to identify if the original poster (OP) or any commenter is actively looking to BUY property.
+
+Hard rules:
+- EXCLUDE renters: People looking to RENT, LEASE, or CHARTER are NOT leads.
+- Only qualify as lead if someone expresses clear intent to PURCHASE/BUY property.
+- Focus on real estate only (apartments, houses, villas, property).
+
+For each potential lead found, determine:
+- source: "op" if original poster, "commenter" if from comments
+- buyer_stage: "researching" (early research), "actively_looking" (actively searching), "ready_to_buy" (imminent purchase)
+- property_type: "apartment", "house", "villa", "townhome", "residential", "holiday house or apartment", "unknown"
+- budget: Extract any mentioned budget/price or "not_mentioned"
+- thread_type: "buyer_seeking" (OP wants to buy), "general_discussion" (discussion where buyer emerged)
 
 Return ONLY JSON with these keys:
 {{
   "is_lead": true/false,
-  "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
-  "lead_type": "buyer" | "seller" | "renter" | "broker" | "other" | "not_lead",
-  "market": "Dubai/Qatar/Spain/..." or "",
+  "source": "op" | "commenter",
+  "buyer_stage": "researching" | "actively_looking" | "ready_to_buy",
   "confidence": number between 0 and 1,
-  "reason": "short explanation",
-  "evidence": "short excerpt proving intent"
+  "property_type": "apartment" | "house" | "villa" | "townhome" | "residential" | "holiday house or apartment" | "unknown",
+  "budget": "extracted budget string or not_mentioned",
+  "evidence": "short direct quote proving buying intent",
+  "reason": "explanation of why this is a valuable lead for sales team",
+  "thread_type": "buyer_seeking" | "general_discussion",
+  "thread_summary": "one sentence summary of the thread"
 }}
 
 THREAD:
@@ -436,12 +446,15 @@ THREAD:
     resp = gemini.models.generate_content(model=cfg.gemini_model, contents=prompt)
     data = _extract_json_loose(getattr(resp, "text", "") or "")
     data.setdefault("is_lead", False)
-    data.setdefault("vertical", "not_lead")
-    data.setdefault("lead_type", "not_lead")
-    data.setdefault("market", "")
+    data.setdefault("source", "op")
+    data.setdefault("buyer_stage", "researching")
     data.setdefault("confidence", 0.0)
-    data.setdefault("reason", "")
+    data.setdefault("property_type", "unknown")
+    data.setdefault("budget", "not_mentioned")
     data.setdefault("evidence", "")
+    data.setdefault("reason", "")
+    data.setdefault("thread_type", "general_discussion")
+    data.setdefault("thread_summary", "")
     return data
 
 
@@ -459,31 +472,34 @@ def _openai_classify(cfg: Config, thread_text: str) -> dict:
         max_retries=2,
     )
     prompt = f"""
-You are a strict lead qualifier for luxury intent on Reddit.
+You are a strict lead qualifier for real estate buyer intent on Reddit.
 
-Based on the thread content, decide if it contains a VALID actionable lead in any of:
-- real_estate (buyer looking to BUY, seller/owner selling, or broker/agent)
-- luxury_car (buyer looking to BUY, seller selling, or dealer)
-- luxury_watch (buyer looking to BUY, seller selling, or dealer/AD)
-- yacht (buyer looking to BUY, seller selling, or broker)
-- private_jet (buyer looking to BUY, seller selling, or broker)
+Analyze the thread to identify if the original poster (OP) or any commenter is actively looking to BUY property.
 
 Hard rules:
-- EXCLUDE renters: People looking to RENT, LEASE, or CHARTER are NOT leads. Return not_lead for them.
-- Only classify as lead if: someone wants to BUY, someone is SELLING/owns and selling, or someone is a BROKER/AGENT/DEALER.
-- Sellers and owners selling should be classified as lead_type "broker".
-- If the content is NOT about these verticals, return not_lead.
-- Evidence must be a short direct quote from the post content.
+- EXCLUDE renters: People looking to RENT, LEASE, or CHARTER are NOT leads.
+- Only qualify as lead if someone expresses clear intent to PURCHASE/BUY property.
+- Focus on real estate only (apartments, houses, villas, property).
+
+For each potential lead found, determine:
+- source: "op" if original poster, "commenter" if from comments
+- buyer_stage: "researching" (early research), "actively_looking" (actively searching), "ready_to_buy" (imminent purchase)
+- property_type: "apartment", "house", "villa", "townhome", "residential", "holiday house or apartment", "unknown"
+- budget: Extract any mentioned budget/price or "not_mentioned"
+- thread_type: "buyer_seeking" (OP wants to buy), "general_discussion" (discussion where buyer emerged)
 
 Return ONLY JSON with these keys:
 {{
   "is_lead": true/false,
-  "vertical": "real_estate" | "luxury_car" | "luxury_watch" | "yacht" | "private_jet" | "other" | "not_lead",
-  "lead_type": "buyer" | "broker" | "not_lead",
-  "market": "Dubai/Qatar/Spain/..." or "",
+  "source": "op" | "commenter",
+  "buyer_stage": "researching" | "actively_looking" | "ready_to_buy",
   "confidence": number between 0 and 1,
-  "reason": "short explanation",
-  "evidence": "short excerpt proving intent"
+  "property_type": "apartment" | "house" | "villa" | "townhome" | "residential" | "holiday house or apartment" | "unknown",
+  "budget": "extracted budget string or not_mentioned",
+  "evidence": "short direct quote proving buying intent",
+  "reason": "explanation of why this is a valuable lead for sales team",
+  "thread_type": "buyer_seeking" | "general_discussion",
+  "thread_summary": "one sentence summary of the thread"
 }}
 
 THREAD:
@@ -518,12 +534,15 @@ THREAD:
 
     data = _extract_json_loose(text)
     data.setdefault("is_lead", False)
-    data.setdefault("vertical", "not_lead")
-    data.setdefault("lead_type", "not_lead")
-    data.setdefault("market", "")
+    data.setdefault("source", "op")
+    data.setdefault("buyer_stage", "researching")
     data.setdefault("confidence", 0.0)
-    data.setdefault("reason", "")
+    data.setdefault("property_type", "unknown")
+    data.setdefault("budget", "not_mentioned")
     data.setdefault("evidence", "")
+    data.setdefault("reason", "")
+    data.setdefault("thread_type", "general_discussion")
+    data.setdefault("thread_summary", "")
     return data
 
 
@@ -604,11 +623,14 @@ def _validate_verdict(cfg: Config, verdict: dict, source_text: str, market_hint:
     v = dict(verdict or {})
 
     is_lead = bool(v.get("is_lead"))
-    vertical = str(v.get("vertical") or "not_lead")
-    lead_type = str(v.get("lead_type") or "not_lead")
-    market = str(v.get("market") or market_hint or "")
+    source = str(v.get("source") or "op")
+    buyer_stage = str(v.get("buyer_stage") or "researching")
+    property_type = str(v.get("property_type") or "unknown")
+    budget = str(v.get("budget") or "not_mentioned")
     reason = str(v.get("reason") or "")
     evidence = str(v.get("evidence") or "")
+    thread_type = str(v.get("thread_type") or "general_discussion")
+    thread_summary = str(v.get("thread_summary") or "")
 
     try:
         confidence = float(v.get("confidence") or 0.0)
@@ -619,53 +641,70 @@ def _validate_verdict(cfg: Config, verdict: dict, source_text: str, market_hint:
     src = (source_text or "").strip()
     src_lower = src.lower()
 
-    # If the model provides "evidence", it must be present in the provided text; otherwise treat as hallucination.
+    # If the model provides "evidence", check that key words are present (relaxed check)
+    # LLMs often paraphrase, so we check for significant words rather than exact match
     ev = (evidence or "").strip()
-    if ev and ev.lower() not in src_lower:
-        return {
-            "is_lead": False,
-            "vertical": "not_lead",
-            "lead_type": "not_lead",
-            "market": market_hint or "",
-            "confidence": 0.0,
-            "reason": "Forced not_lead: evidence not found in input context.",
-            "evidence": "",
-        }
+    if ev:
+        # Extract significant words (4+ chars) from evidence
+        ev_words = [w.lower() for w in re.findall(r'\b\w{4,}\b', ev)]
+        # Require at least 50% of significant words to be present in source
+        if ev_words:
+            matches = sum(1 for w in ev_words if w in src_lower)
+            match_ratio = matches / len(ev_words)
+            if match_ratio < 0.4:  # Less than 40% of words found = likely hallucination
+                return {
+                    "is_lead": False,
+                    "source": source,
+                    "buyer_stage": "researching",
+                    "confidence": 0.0,
+                    "property_type": "unknown",
+                    "budget": "not_mentioned",
+                    "evidence": "",
+                    "reason": "Forced not_lead: evidence not found in input context.",
+                    "thread_type": "general_discussion",
+                    "thread_summary": thread_summary,
+                }
 
-    # Prevent obvious false positives: require some vertical hint if a lead is claimed.
-    if vertical not in {"not_lead", "other"} or is_lead:
-        has_hint = any(h in src_lower for hints in _VERTICAL_HINTS.values() for h in hints)
+    # Prevent obvious false positives: require real estate hints if a lead is claimed.
+    if is_lead:
+        real_estate_hints = _VERTICAL_HINTS.get("real_estate", [])
+        has_hint = any(h in src_lower for h in real_estate_hints)
         if not has_hint and "/comments/" not in src_lower:
             return {
                 "is_lead": False,
-                "vertical": "not_lead",
-                "lead_type": "not_lead",
-                "market": market_hint or "",
+                "source": source,
+                "buyer_stage": "researching",
                 "confidence": 0.0,
-                "reason": "Forced not_lead: no luxury vertical evidence in provided context.",
+                "property_type": "unknown",
+                "budget": "not_mentioned",
                 "evidence": "",
+                "reason": "Forced not_lead: no real estate evidence in provided context.",
+                "thread_type": "general_discussion",
+                "thread_summary": thread_summary,
             }
 
-    # Normalize rent/charter to renter.
+    # Exclude renters - check for rental keywords
     rental_tokens = [" rent", " rental", " lease", " leasing", " charter", " short term"]
-    if lead_type == "buyer" and any(tok in f" {src_lower} " for tok in rental_tokens):
-        lead_type = "renter"
-
-    # Ensure not_lead consistency.
-    if vertical == "not_lead" or lead_type == "not_lead":
-        is_lead = False
-        vertical = "not_lead"
-        lead_type = "not_lead"
-        confidence = min(confidence, 0.25)
+    if is_lead and any(tok in f" {src_lower} " for tok in rental_tokens):
+        # Check if it's primarily about renting vs buying
+        buy_tokens = [" buy", " purchase", " buying", " purchasing"]
+        has_buy = any(tok in f" {src_lower} " for tok in buy_tokens)
+        if not has_buy:
+            is_lead = False
+            confidence = min(confidence, 0.25)
+            reason = "Excluded: appears to be about renting, not buying."
 
     return {
         "is_lead": bool(is_lead),
-        "vertical": vertical,
-        "lead_type": lead_type,
-        "market": market,
+        "source": source,
+        "buyer_stage": buyer_stage,
         "confidence": confidence,
-        "reason": reason,
+        "property_type": property_type,
+        "budget": budget,
         "evidence": evidence,
+        "reason": reason,
+        "thread_type": thread_type,
+        "thread_summary": thread_summary,
     }
 
 
@@ -811,27 +850,45 @@ Be strict - only BUYING or SELLING property. Renters = not_lead."""
 
 def _heuristic_classify(text: str, market_hint: str = "") -> dict:
     t = (text or "").lower()
-    vertical = "other"
-    for v, hints in _VERTICAL_HINTS.items():
-        if any(h in t for h in hints):
-            vertical = v
-            break
 
-    lead_type = "other"
-    for lt, words in _INTENT_WORDS.items():
-        if any(w in t for w in words):
-            lead_type = lt
-            break
+    # Check for real estate hints
+    has_real_estate = any(h in t for h in _VERTICAL_HINTS.get("real_estate", []))
 
-    is_lead = vertical != "other" and lead_type in {"buyer", "seller", "renter", "broker"}
+    # Check for buyer intent
+    buyer_words = ["looking to buy", "buying", "purchase", "buy", "budget", "mortgage", "financing"]
+    has_buyer_intent = any(w in t for w in buyer_words)
+
+    is_lead = has_real_estate and has_buyer_intent
+
+    # Determine buyer stage based on keywords
+    buyer_stage = "researching"
+    if any(w in t for w in ["ready to", "about to", "going to buy", "closing", "making offer"]):
+        buyer_stage = "ready_to_buy"
+    elif any(w in t for w in ["looking for", "searching", "visiting", "viewing"]):
+        buyer_stage = "actively_looking"
+
+    # Try to detect property type
+    property_type = "unknown"
+    if "apartment" in t or "flat" in t:
+        property_type = "apartment"
+    elif "villa" in t:
+        property_type = "villa"
+    elif "house" in t or "home" in t:
+        property_type = "house"
+    elif "townhome" in t or "townhouse" in t:
+        property_type = "townhome"
+
     return {
         "is_lead": bool(is_lead),
-        "vertical": vertical if is_lead else "not_lead",
-        "lead_type": lead_type if is_lead else "not_lead",
-        "market": market_hint or "",
+        "source": "op",
+        "buyer_stage": buyer_stage if is_lead else "researching",
         "confidence": 0.65 if is_lead else 0.25,
-        "reason": "Heuristic classification (no Gemini key configured)." if is_lead else "No clear actionable intent found.",
+        "property_type": property_type,
+        "budget": "not_mentioned",
         "evidence": _truncate(text, 280),
+        "reason": "Heuristic classification (no API key configured)." if is_lead else "No clear buying intent found.",
+        "thread_type": "buyer_seeking" if is_lead else "general_discussion",
+        "thread_summary": "",
     }
 
 
@@ -906,30 +963,30 @@ def run_once(
     certain_leads, needs_verification = _prefilter_batch(cfg, prefilter_items, status_cb=status_cb)
 
     if status_cb:
-        status_cb(stage="prefilter", stage_detail=f"Pre-filter done: {len(certain_leads)} certain leads, {len(needs_verification)} to verify, {len(urls) - len(certain_leads) - len(needs_verification)} discarded")
+        status_cb(stage="prefilter", stage_detail=f"Pre-filter done: {len(certain_leads)} likely leads, {len(needs_verification)} to verify, {len(urls) - len(certain_leads) - len(needs_verification)} discarded")
 
-    # Only scrape URLs that need verification - limit to 20 to save Apify credits
-    max_verify = 20
-    urls_to_scrape = [item.get("url") for item in needs_verification if item.get("url")][:max_verify]
-    if len(needs_verification) > max_verify:
+    # FIXED: ALL leads must go through full content validation - no shortcuts!
+    # Combine certain_leads and needs_verification for full Apify scraping
+    all_leads_to_validate = certain_leads + needs_verification
+    max_verify = 40  # Increased limit since we're validating all potential leads
+    urls_to_scrape = [item.get("url") for item in all_leads_to_validate if item.get("url")][:max_verify]
+    if len(all_leads_to_validate) > max_verify:
         if status_cb:
-            status_cb(stage="prefilter", stage_detail=f"Limiting verification to {max_verify} URLs (had {len(needs_verification)})")
+            status_cb(stage="prefilter", stage_detail=f"Limiting validation to {max_verify} URLs (had {len(all_leads_to_validate)})")
 
     all_out = cfg.data_dir / "all_results.csv"
     leads_out = cfg.data_dir / "leads_only.csv"
     fieldnames = [
-        "ts_utc",
-        "query",
-        "post_id",
         "url",
-        "title",
-        "vertical",
-        "is_lead",
-        "lead_type",
-        "market",
+        "source",
+        "buyer_stage",
         "confidence",
-        "reason",
+        "property_type",
+        "budget",
         "evidence",
+        "reason",
+        "thread_type",
+        "thread_summary",
     ]
 
     total_count = 0
@@ -944,45 +1001,19 @@ def run_once(
         all_f.flush()
         leads_f.flush()
 
-        def _write_row(row: dict) -> None:
+        def _write_row(row: dict, is_lead: bool) -> None:
             nonlocal total_count, leads_count
             all_w.writerow(row)
             all_f.flush()
             total_count += 1
-            if bool(row.get("is_lead")):
+            if is_lead:
                 leads_w.writerow(row)
                 leads_f.flush()
                 leads_count += 1
 
         # ============================================================
-        # Step 1: Write certain leads directly (no Apify needed)
-        # ============================================================
-        if status_cb:
-            status_cb(stage="certain", stage_detail=f"Adding {len(certain_leads)} certain leads directly...")
-
-        for item in certain_leads:
-            url = item.get("url", "")
-            title = item.get("title", "")
-            query = item.get("query", "")
-            market_hint = item.get("market") or _market_hint_from_url_or_query(url, query)
-
-            _write_row({
-                "ts_utc": datetime.now(timezone.utc).isoformat(),
-                "query": query,
-                "post_id": "",
-                "url": url,
-                "title": title,
-                "vertical": item.get("vertical", "real_estate"),
-                "is_lead": True,
-                "lead_type": item.get("lead_type", "buyer"),
-                "market": market_hint,
-                "confidence": 0.85,
-                "reason": "Certain lead from title/snippet pre-filter",
-                "evidence": item.get("snippet", "")[:200],
-            })
-
-        # ============================================================
-        # Step 2: Scrape only URLs that need verification with Apify
+        # Step 1: Scrape ALL potential leads with Apify for full validation
+        # (No more direct writes - all leads must be validated with full content)
         # ============================================================
         if urls_to_scrape:
             if status_cb:
@@ -1002,7 +1033,7 @@ def run_once(
         if status_cb:
             status_cb(stage="apify", stage_detail=f"Apify done: {len(posts)} posts, {sum(len(c) for c in comments_by_post.values())} comments")
 
-        # Step 2: Classify each post using OpenAI with full thread content
+        # Step 2: Classify each post using OpenAI with FULL thread content (the only path now)
         if status_cb:
             status_cb(stage="classify", stage_detail=f"Classifying {len(posts)} posts (classifier={_classifier_label(cfg)})")
 
@@ -1041,19 +1072,18 @@ def run_once(
 
             _write_row(
                 {
-                    "ts_utc": datetime.now(timezone.utc).isoformat(),
-                    "query": query,
-                    "post_id": pid,
                     "url": url,
-                    "title": title,
-                    "vertical": verdict.get("vertical", "not_lead"),
-                    "is_lead": bool(verdict.get("is_lead")),
-                    "lead_type": verdict.get("lead_type", "not_lead"),
-                    "market": verdict.get("market", market_hint),
+                    "source": verdict.get("source", "op"),
+                    "buyer_stage": verdict.get("buyer_stage", "researching"),
                     "confidence": verdict.get("confidence", 0.0),
-                    "reason": verdict.get("reason", ""),
+                    "property_type": verdict.get("property_type", "unknown"),
+                    "budget": verdict.get("budget", "not_mentioned"),
                     "evidence": verdict.get("evidence", ""),
-                }
+                    "reason": verdict.get("reason", ""),
+                    "thread_type": verdict.get("thread_type", "general_discussion"),
+                    "thread_summary": verdict.get("thread_summary", title),
+                },
+                is_lead=bool(verdict.get("is_lead")),
             )
 
             completed += 1

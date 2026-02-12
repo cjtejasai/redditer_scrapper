@@ -33,29 +33,31 @@
       </section>
 
       <section class="toolbar">
-        <input id="filter" class="input" placeholder="Filter leads (market, vertical, title, reason…)" />
+        <input id="filter" class="input" placeholder="Filter leads (url, source, buyer_stage, evidence…)" />
         <label class="toggle-label">
           <input type="checkbox" id="showAll" />
           <span>Show all (incl. rejected)</span>
         </label>
-        <div class="hint">Tip: set <code>PERPLEXITY_API_KEY</code> in <code>.env</code> for better classification.</div>
+        <div class="download-actions">
+          <button id="downloadCsv" class="btn btn-download">Download CSV</button>
+          <button id="downloadExcel" class="btn btn-download">Download Excel</button>
+        </div>
       </section>
 
       <section class="tableWrap">
         <table class="table" id="leadsTable">
           <thead>
             <tr>
-              <th>Run</th>
-              <th>Market</th>
-              <th>Category</th>
-              <th>Intent</th>
-              <th>Confidence</th>
-              <th>Query</th>
-              <th>Title</th>
               <th>URL</th>
-              <th>Reason</th>
+              <th>Source</th>
+              <th>Buyer Stage</th>
+              <th>Confidence</th>
+              <th>Property Type</th>
+              <th>Budget</th>
               <th>Evidence</th>
-              <th>TS (UTC)</th>
+              <th>Reason for Sales</th>
+              <th>Thread Type</th>
+              <th>Thread Summary</th>
             </tr>
           </thead>
           <tbody id="leadsBody"></tbody>
