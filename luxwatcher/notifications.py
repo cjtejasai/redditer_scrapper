@@ -7,7 +7,7 @@ import os
 from typing import Any
 
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email, To, Content
+from sendgrid.helpers.mail import Mail, Email, To, Cc, Content
 
 
 def send_leads_notification(
@@ -36,6 +36,10 @@ def send_leads_notification(
     to_emails = [e.strip() for e in to_emails_str.split(",") if e.strip()]
     if not to_emails:
         return {"success": False, "error": "No valid recipient emails"}
+
+    # Get CC emails
+    cc_emails_str = os.getenv("SENDGRID_CC_EMAILS", "")
+    cc_emails = [e.strip() for e in cc_emails_str.split(",") if e.strip()]
 
     # Build email content
     subject = f"Reddit Watcher: {leads_count} New Leads Found"
@@ -192,11 +196,16 @@ def send_leads_notification(
             html_content=Content("text/html", html_content),
         )
 
+        # Add CC recipients
+        if cc_emails:
+            for cc_email in cc_emails:
+                message.add_cc(Cc(cc_email))
+
         response = sg.send(message)
 
         return {
             "success": True,
-            "message": f"Email sent to {len(to_emails)} recipients",
+            "message": f"Email sent to {len(to_emails)} recipients, CC: {len(cc_emails)}",
             "status_code": response.status_code,
         }
 
