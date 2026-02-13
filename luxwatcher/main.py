@@ -15,9 +15,13 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi import Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 from luxwatcher.pipeline import load_config, run_once
 from luxwatcher.storage import read_csv_dicts
+from luxwatcher.notifications import send_leads_notification
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -170,6 +174,30 @@ async def _run_pipeline_background() -> None:
                 except Exception:
                     pass
             _set_status(stage="done", stage_detail=f"Done. Leads: {summary.get('leads')} / Total: {summary.get('total')}")
+
+            # Send email notification on success
+            if os.getenv("SENDGRID_API_KEY"):
+                try:
+                    leads_data = []
+                    leads_csv = summary.get("leads_out")
+                    if leads_csv:
+                        leads_data = read_csv_dicts(Path(leads_csv), limit=10)
+
+                    dashboard_url = os.getenv("DASHBOARD_URL") or os.getenv("NGROK_DOMAIN")
+                    if dashboard_url and not dashboard_url.startswith("http"):
+                        dashboard_url = f"https://{dashboard_url}"
+
+                    notif_result = send_leads_notification(
+                        leads_count=summary.get("leads", 0),
+                        total_count=summary.get("total", 0),
+                        run_id=run_id,
+                        leads_data=leads_data,
+                        dashboard_url=dashboard_url,
+                    )
+                    if notif_result.get("success"):
+                        _set_status(stage="done", stage_detail=f"Done. Leads: {summary.get('leads')} / Total: {summary.get('total')} | Email sent")
+                except Exception as notif_err:
+                    pass  # Don't fail the run if notification fails
         except Exception as e:
             try:
                 cfg = load_config()
@@ -214,6 +242,39 @@ async def _periodic_runner(interval_hours: float) -> None:
             await _run_pipeline_background()
 
 
+def _send_daily_email() -> None:
+    """Send daily scheduled email with latest leads."""
+    if not os.getenv("SENDGRID_API_KEY"):
+        return
+
+    try:
+        cfg = load_config()
+        leads_csv = cfg.data_dir / "leads_only.csv"
+
+        if not leads_csv.exists():
+            return
+
+        leads_data = read_csv_dicts(leads_csv, limit=50)
+        leads_count = len(leads_data)
+
+        if leads_count == 0:
+            return
+
+        dashboard_url = os.getenv("DASHBOARD_URL") or os.getenv("NGROK_DOMAIN")
+        if dashboard_url and not dashboard_url.startswith("http"):
+            dashboard_url = f"https://{dashboard_url}"
+
+        send_leads_notification(
+            leads_count=leads_count,
+            total_count=leads_count,
+            run_id=f"daily_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
+            leads_data=leads_data,
+            dashboard_url=dashboard_url,
+        )
+    except Exception:
+        pass  # Don't crash on email failure
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -224,11 +285,28 @@ async def lifespan(app: FastAPI):
             state.run_history = history
     except Exception:
         pass
+
+    # Start pipeline runner
     interval_hours = float(os.getenv("SCRAPE_INTERVAL_HOURS", "24"))
     task = asyncio.create_task(_periodic_runner(interval_hours))
+
+    # Start daily email scheduler (10 AM Dubai time)
+    scheduler = AsyncIOScheduler()
+    daily_email_hour = int(os.getenv("DAILY_EMAIL_HOUR", "10"))
+    dubai_tz = pytz.timezone("Asia/Dubai")
+
+    scheduler.add_job(
+        _send_daily_email,
+        CronTrigger(hour=daily_email_hour, minute=0, timezone=dubai_tz),
+        id="daily_email",
+        name="Daily 10 AM Dubai Email",
+    )
+    scheduler.start()
+
     try:
         yield
     finally:
+        scheduler.shutdown(wait=False)
         state.shutdown.set()
         task.cancel()
         try:
