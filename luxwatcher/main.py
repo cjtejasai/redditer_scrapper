@@ -290,23 +290,12 @@ async def lifespan(app: FastAPI):
     interval_hours = float(os.getenv("SCRAPE_INTERVAL_HOURS", "24"))
     task = asyncio.create_task(_periodic_runner(interval_hours))
 
-    # Start daily email scheduler (10 AM Dubai time)
-    scheduler = AsyncIOScheduler()
-    daily_email_hour = int(os.getenv("DAILY_EMAIL_HOUR", "10"))
-    dubai_tz = pytz.timezone("Asia/Dubai")
-
-    scheduler.add_job(
-        _send_daily_email,
-        CronTrigger(hour=daily_email_hour, minute=0, timezone=dubai_tz),
-        id="daily_email",
-        name="Daily 10 AM Dubai Email",
-    )
-    scheduler.start()
+    # Email is sent after pipeline completes (in _run_pipeline_background)
+    # No separate scheduler needed
 
     try:
         yield
     finally:
-        scheduler.shutdown(wait=False)
         state.shutdown.set()
         task.cancel()
         try:
