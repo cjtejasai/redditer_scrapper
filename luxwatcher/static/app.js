@@ -142,8 +142,8 @@ function populateRunSelect(runs, latestRunId) {
 
 async function refresh() {
   const [status, runsResp] = await Promise.all([
-    fetchJSON("/api/status"),
-    fetchJSON("/api/runs?limit=50"),
+    fetchJSON("/watcher/api/status"),
+    fetchJSON("/watcher/api/runs?limit=50"),
   ]);
   setPill(status);
   document.getElementById("lastStarted").textContent = status.last_started ?? "—";
@@ -164,8 +164,8 @@ async function refresh() {
   const showAll = document.getElementById("showAll").checked;
   const includeAllParam = showAll ? "&include_all=true" : "";
   const leadsUrl = selectedRunId
-    ? `/api/leads?limit=500&run_id=${encodeURIComponent(selectedRunId)}${includeAllParam}`
-    : `/api/leads?limit=500${includeAllParam}`;
+    ? `/watcher/api/leads?limit=500&run_id=${encodeURIComponent(selectedRunId)}${includeAllParam}`
+    : `/watcher/api/leads?limit=500${includeAllParam}`;
 
   const leads = await fetchJSON(leadsUrl);
   window.__leads = (leads.items ?? []).map((it) => ({
@@ -179,7 +179,7 @@ async function runNow() {
   const btn = document.getElementById("runNow");
   btn.disabled = true;
   try {
-    const res = await fetch("/api/run", { method: "POST" });
+    const res = await fetch("/watcher/api/run", { method: "POST" });
     if (res.status === 409) return; // already running
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     await refresh();
